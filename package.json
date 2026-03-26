@@ -1,0 +1,21 @@
+{
+  "name": "atherum",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Collective intelligence engine — synthetic social systems for predictive simulation and deliberative evaluation",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "test": "turbo test",
+    "lint": "turbo lint",
+    "db:generate": "pnpm --filter @atherum/store drizzle-kit generate",
+    "db:migrate": "pnpm --filter @atherum/store drizzle-kit migrate",
+    "infra:up": "docker compose -f infra/docker-compose.yml up -d",
+    "infra:down": "docker compose -f infra/docker-compose.yml down"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.5.0"
+  },
+  "packageManager": "pnpm@9.0.0"
+}
