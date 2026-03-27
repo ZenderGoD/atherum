@@ -1,78 +1,22 @@
 # Atherum — Local Development Infrastructure
 #
-# Services:
-#   - postgres: Primary data store (sessions, personas, audit, cost)
-#   - redis: Caches, queues (BullMQ), session state, agent roster
-#   - neo4j: Knowledge graph store (Atlas engine)
-#   - oasis-worker: Python OASIS simulation worker
+# Storage is handled by Convex (cloud). This file only contains
+# services that must run locally.
 #
-# The TypeScript API runs outside Docker (via pnpm dev) and connects
-# to these services on localhost.
-
-version: "3.8"
+# Usage: docker compose -f infra/docker-compose.yml up -d
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: atherum
-      POSTGRES_USER: atherum
-      POSTGRES_PASSWORD: atherum_dev
-    volumes:
-      - atherum_postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U atherum"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - atherum_redis:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  neo4j:
-    image: neo4j:5-community
-    ports:
-      - "7474:7474" # Browser
-      - "7687:7687" # Bolt
-    environment:
-      NEO4J_AUTH: neo4j/atherum_dev
-      NEO4J_PLUGINS: '["apoc"]'
-    volumes:
-      - atherum_neo4j:/data
-    healthcheck:
-      test: ["CMD", "neo4j", "status"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-
   oasis-worker:
     build:
       context: ../apps/oasis-worker
       dockerfile: Dockerfile
     ports:
-      - "8100:8100"
+      - "4001:4001"
     environment:
-      OASIS_PORT: 8100
+      OASIS_PORT: 4001
       OASIS_HOST: 0.0.0.0
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:4001/health"]
       interval: 10s
       timeout: 5s
       retries: 3
-
-volumes:
-  atherum_postgres:
-  atherum_redis:
-  atherum_neo4j:

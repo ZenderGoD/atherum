@@ -14,12 +14,9 @@
     "dev": "tsup src/index.ts --format esm --dts --watch"
   },
   "dependencies": {
-    "drizzle-orm": "^0.45.1",
-    "ioredis": "^5.4.0",
-    "postgres": "^3.4.0"
+    "convex": "^1.32.0"
   },
   "devDependencies": {
-    "drizzle-kit": "^0.31.10",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0"
   }

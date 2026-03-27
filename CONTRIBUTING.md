@@ -16,36 +16,44 @@ Thanks for your interest in contributing to Atherum. This guide will help you ge
 git clone https://github.com/ZenderGoD/atherum.git
 cd atherum
 pnpm install
-cp .env.example .env
-# Add your LLM_API_KEY to .env
-pnpm build
+
+# Set up Convex backend
+npx convex dev
+# Follow prompts to create a project
+
+# Set LLM env vars in Convex
+npx convex env set LLM_API_KEY "your-openrouter-key"
+npx convex env set LLM_BASE_URL "https://openrouter.ai/api/v1"
+npx convex env set LLM_MODEL_NAME "google/gemini-3.1-flash-lite-preview:nitro"
 ```
 
 ### Running locally
 
 ```bash
-# API server (port 4000)
-pnpm --filter @atherum/api dev
+# Convex backend (watches for changes, auto-deploys)
+npx convex dev
 
 # Landing page (port 3100)
 pnpm --filter @atherum/web dev
 
-# Run a test review
-bash scripts/test-review.sh 3 2
+# Test a review via curl
+curl -X POST https://your-deployment.convex.site/api/review \
+  -H "Content-Type: application/json" \
+  -d '{"content_description": "test image", "content_type": "image", "review_id": "test_001", "max_rounds": 2, "agent_count": 3}'
 ```
 
 ## Project Structure
 
 ```
-apps/api/          → Hono API server
+convex/            → Convex backend (API, database, actions)
 apps/web/          → Next.js marketing site
 apps/oasis-worker/ → Python social simulation worker
 packages/core/     → Shared types, IDs, errors
-packages/mirage/   → Deliberation engine
+packages/mirage/   → Deliberation engine (convergence algorithm)
 packages/personas/ → Persona generation + memory
 packages/oasis-bridge/ → OASIS worker client
 packages/orchestrator/ → Multi-engine workflows
-packages/store/    → Database schema + cache
+packages/store/    → Convex client helper
 ```
 
 ## How to Contribute
