@@ -146,10 +146,17 @@ async function withRetry<T>(
   fn: () => Promise<T>,
   retries = 2,
   baseDelay = 1000,
+  timeoutMs = 30000,
 ): Promise<T> {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await fn();
+      // Race against a timeout to prevent hanging calls
+      return await Promise.race([
+        fn(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs)
+        ),
+      ]);
     } catch (err) {
       if (attempt === retries) throw err;
       const delay = baseDelay * Math.pow(3, attempt); // 1s, 3s, 9s
@@ -380,14 +387,20 @@ Respond with a JSON object:
 async function embedTexts(texts: string[]): Promise<number[][] | null> {
   try {
     const { client } = getLLMClient();
-    const response = await client.embeddings.create({
-      model: "text-embedding-3-small",
-      input: texts,
-    });
+    // Race against a 5s timeout — if embeddings aren't fast, TF-IDF is fine
+    const response = await Promise.race([
+      client.embeddings.create({
+        model: "text-embedding-3-small",
+        input: texts,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Embedding timeout (5s)")), 5000)
+      ),
+    ]);
     return response.data.map((d) => d.embedding);
   } catch (err) {
     console.warn(
-      "[embeddings] Embedding call failed, falling back to TF-IDF:",
+      "[embeddings] Falling back to TF-IDF:",
       err instanceof Error ? err.message : err,
     );
     return null;
@@ -965,10 +978,10 @@ async function runAgentBatch(
   previousSummary: string | undefined,
   previousResponses: AgentResponse[] | undefined,
 ): Promise<{ responses: AgentResponse[]; partial: boolean }> {
-  const MAX_PARALLEL = 5;
+  const MAX_PARALLEL = agents.length <= 5 ? agents.length : 5;
   const responses: AgentResponse[] = [];
 
-  // Process agents in batches of MAX_PARALLEL
+  // Process agents in batches of MAX_PARALLEL (no batching if <=5 agents)
   for (let batchStart = 0; batchStart < agents.length; batchStart += MAX_PARALLEL) {
     const batchEnd = Math.min(batchStart + MAX_PARALLEL, agents.length);
     const batchPromises: Promise<AgentResponse | null>[] = [];
