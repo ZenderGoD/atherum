@@ -3,24 +3,42 @@
 /**
  * Atherum — Deliberation Action (Convex Node.js runtime)
  *
- * Runs the full multi-agent deliberation loop:
- *   1. Build panelist personas
- *   2. Run rounds with concurrent LLM calls
- *   3. Measure convergence (TF-IDF cosine similarity)
- *   4. Synthesize final verdict
- *   5. Persist everything via mutations
- *   6. Send webhook callback
+ * Rewritten to integrate five Convex components:
+ *   1. @convex-dev/agent — Agent definitions, thread management, generateText
+ *   2. @convex-dev/rate-limiter — Per-workspace, per-review, and global limits
+ *   3. @convex-dev/workpool — Bounded concurrent LLM calls (max 5 parallel)
+ *   4. @mzedstudio/llm-cache — Deduplicates identical LLM requests
+ *   5. @convex-dev/crons — (registered separately in cronSetup.ts)
+ *
+ * Flow:
+ *   1. Check rate limits
+ *   2. Create agents and threads via Agent component
+ *   3. Run rounds using Workpool-bounded parallelism with LLM Cache
+ *   4. Measure convergence (TF-IDF cosine similarity)
+ *   5. Synthesize final verdict
+ *   6. Persist everything via mutations
+ *   7. Send webhook callback
  */
 
 import { v } from "convex/values";
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { createReviewerAgents, getPersonaMeta, REVIEWER_PERSONAS } from "./agents";
+import { rateLimiter } from "./rateLimiter";
+import { LLMCache } from "@mzedstudio/llm-cache";
+import { components } from "./_generated/api";
+import crypto from "node:crypto";
 import OpenAI from "openai";
 import type {
   ChatCompletionMessageParam,
   ChatCompletionContentPart,
 } from "openai/resources/chat/completions";
-import crypto from "node:crypto";
+
+// ---------------------------------------------------------------------------
+// LLM Cache instance
+// ---------------------------------------------------------------------------
+
+const llmCache = new LLMCache(components.llmCache);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,13 +50,6 @@ interface AgentMeta {
   reasoningStyle: string;
   persona: string;
   confidence: number;
-}
-
-interface PanelistContext {
-  agentId: string;
-  name: string;
-  reasoningStyle: string;
-  systemPrompt: string;
 }
 
 interface AgentResponse {
@@ -62,151 +73,7 @@ interface RoundData {
 }
 
 // ---------------------------------------------------------------------------
-// Reviewer persona definitions
-// ---------------------------------------------------------------------------
-
-const REVIEWER_ROLES = [
-  {
-    name: "Target Audience Member",
-    persona:
-      "You are a typical member of the target audience. You evaluate content based on whether it resonates with you personally, whether you would engage with it, share it, or scroll past it. You represent the everyday consumer's perspective.",
-  },
-  {
-    name: "Brand Critic",
-    persona:
-      "You are a sharp brand critic with deep knowledge of brand strategy. You evaluate whether content aligns with brand identity, maintains consistency, and strengthens brand equity. You notice when brands stray from their core values.",
-  },
-  {
-    name: "Trend Analyst",
-    persona:
-      "You are a cultural trend analyst who tracks emerging patterns in media, fashion, technology, and social behavior. You evaluate content based on its cultural relevance, timeliness, and alignment with current or emerging trends.",
-  },
-  {
-    name: "Marketing Expert",
-    persona:
-      "You are a seasoned marketing professional with expertise in campaign strategy, audience segmentation, and performance metrics. You evaluate content based on its potential to drive engagement, conversions, and measurable business outcomes.",
-  },
-  {
-    name: "Social Media User",
-    persona:
-      "You are an active social media user who spends significant time on Instagram, TikTok, and other platforms. You evaluate content based on its scroll-stopping power, shareability, and how it compares to what performs well in your feed.",
-  },
-  {
-    name: "Creative Director",
-    persona:
-      "You are a creative director with years of experience leading visual campaigns. You evaluate content on craft quality -- composition, color theory, typography, visual hierarchy, and overall creative execution. You have high standards.",
-  },
-  {
-    name: "UX Designer",
-    persona:
-      "You are a UX designer focused on user experience and interaction design. You evaluate content based on clarity, accessibility, readability, and how well it communicates its intended message to diverse audiences.",
-  },
-  {
-    name: "E-commerce Specialist",
-    persona:
-      "You are an e-commerce specialist who understands what drives purchase decisions. You evaluate content based on its ability to showcase products effectively, build desire, and move consumers toward purchase.",
-  },
-  {
-    name: "Consumer Psychologist",
-    persona:
-      "You are a consumer psychologist who studies decision-making, emotional responses, and behavioral triggers. You evaluate content based on its psychological impact -- emotional resonance, cognitive load, persuasion techniques, and memorability.",
-  },
-  {
-    name: "Photographer",
-    persona:
-      "You are a professional photographer and visual artist. You evaluate content on technical and artistic merit -- lighting, composition, color grading, focus, and visual storytelling. You appreciate both commercial and artistic photography.",
-  },
-];
-
-const REASONING_STYLES = [
-  "analytical",
-  "creative",
-  "skeptical",
-  "pragmatic",
-  "synthesizing",
-  "visionary",
-] as const;
-
-type ReasoningStyle = (typeof REASONING_STYLES)[number];
-
-function getReasoningStyleDescription(style: ReasoningStyle): string {
-  const descriptions: Record<ReasoningStyle, string> = {
-    analytical:
-      "You approach evaluation systematically, breaking down content into components and assessing each on its merits. You prefer data and evidence over gut feelings.",
-    creative:
-      "You evaluate with an artistic sensibility, looking for innovation, emotional impact, and creative risk-taking. You appreciate when content pushes boundaries.",
-    skeptical:
-      "You are naturally critical and question assumptions. You look for weaknesses, inconsistencies, and potential issues. You play devil's advocate.",
-    pragmatic:
-      "You focus on practical outcomes. Does it work? Will it achieve its goals? You care less about artistic merit and more about real-world effectiveness.",
-    synthesizing:
-      "You look for connections and patterns across different aspects. You build holistic assessments by weaving together multiple viewpoints into coherent narratives.",
-    visionary:
-      "You evaluate content against future possibilities. You consider how it positions the brand for emerging trends and whether it feels forward-thinking.",
-  };
-  return descriptions[style];
-}
-
-// ---------------------------------------------------------------------------
-// Build panelists
-// ---------------------------------------------------------------------------
-
-function buildPanelists(agentCount: number): {
-  panelists: PanelistContext[];
-  agentMeta: AgentMeta[];
-} {
-  const count = Math.min(agentCount, REVIEWER_ROLES.length);
-  const panelists: PanelistContext[] = [];
-  const agentMeta: AgentMeta[] = [];
-
-  for (let i = 0; i < count; i++) {
-    const role = REVIEWER_ROLES[i];
-    const reasoningStyle = REASONING_STYLES[i % REASONING_STYLES.length];
-    const agentId = crypto.randomUUID();
-
-    const systemPrompt = `# Your Role: ${role.name}
-
-${role.persona}
-
-## Your Reasoning Style: ${reasoningStyle}
-${getReasoningStyleDescription(reasoningStyle)}
-
-## Evaluation Dimensions
-Score the content on these dimensions (1-10 each):
-1. **Visual Impact** - How visually striking and attention-grabbing is the content?
-2. **Brand Alignment** - How well does the content align with professional brand standards?
-3. **Audience Resonance** - How likely is the target audience to connect with this content?
-4. **Creativity** - How original and creative is the execution?
-5. **Effectiveness** - How well does the content achieve its apparent goal?
-
-## Important Rules
-- Stay in character as ${role.name} at all times
-- Apply your ${reasoningStyle} reasoning style to your analysis
-- Be specific and reference concrete elements of the content
-- Provide honest, constructive feedback -- do not be uniformly positive or negative
-- Your confidence score should reflect how certain you are of your assessment`;
-
-    panelists.push({
-      agentId,
-      name: role.name,
-      reasoningStyle,
-      systemPrompt,
-    });
-
-    agentMeta.push({
-      agentId,
-      name: role.name,
-      reasoningStyle,
-      persona: role.persona.slice(0, 200),
-      confidence: 0,
-    });
-  }
-
-  return { panelists, agentMeta };
-}
-
-// ---------------------------------------------------------------------------
-// LLM client helpers
+// LLM client helpers (kept for synthesis + round summary which don't use Agent)
 // ---------------------------------------------------------------------------
 
 function getLLMClient(): { client: OpenAI; model: string } {
@@ -218,7 +85,8 @@ function getLLMClient(): { client: OpenAI; model: string } {
   return { client, model };
 }
 
-async function llmComplete(
+async function llmCompleteWithCache(
+  ctx: any,
   systemPrompt: string,
   userPrompt: string,
   options?: {
@@ -226,8 +94,9 @@ async function llmComplete(
     maxTokens?: number;
     jsonMode?: boolean;
     imageUrl?: string;
+    tags?: string[];
   },
-): Promise<{ content: string; tokenUsage: { input: number; output: number } }> {
+): Promise<{ content: string; tokenUsage: { input: number; output: number }; cached: boolean }> {
   const { client, model } = getLLMClient();
 
   const messages: ChatCompletionMessageParam[] = [
@@ -244,6 +113,38 @@ async function llmComplete(
     messages.push({ role: "user", content: userPrompt });
   }
 
+  const request = {
+    model,
+    messages: messages.map((m) => ({
+      role: String(m.role),
+      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+    })),
+    temperature: options?.temperature ?? 0.7,
+    max_tokens: options?.maxTokens ?? 2048,
+  };
+
+  // Check LLM Cache first
+  try {
+    const cached = await llmCache.lookup(ctx, { request });
+    if (cached) {
+      console.log("[cache] HIT for LLM request");
+      const choice = (cached.response as any)?.choices?.[0];
+      const usage = (cached.response as any)?.usage;
+      return {
+        content: choice?.message?.content || JSON.stringify(cached.response),
+        tokenUsage: {
+          input: usage?.prompt_tokens ?? 0,
+          output: usage?.completion_tokens ?? 0,
+        },
+        cached: true,
+      };
+    }
+  } catch (e) {
+    // Cache lookup failed, proceed with live call
+    console.warn("[cache] Lookup error, proceeding with live call:", e);
+  }
+
+  // Cache miss — make the live LLM call
   const response = await client.chat.completions.create({
     model,
     messages,
@@ -251,6 +152,18 @@ async function llmComplete(
     max_tokens: options?.maxTokens ?? 2048,
     ...(options?.jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
+
+  // Store in cache
+  try {
+    await llmCache.store(ctx, {
+      request,
+      response: response as any,
+      tags: options?.tags || ["deliberation"],
+    });
+    console.log("[cache] STORED LLM response");
+  } catch (e) {
+    console.warn("[cache] Store error:", e);
+  }
 
   const choice = response.choices[0];
   const usage = response.usage;
@@ -261,6 +174,7 @@ async function llmComplete(
       input: usage?.prompt_tokens ?? 0,
       output: usage?.completion_tokens ?? 0,
     },
+    cached: false,
   };
 }
 
@@ -331,7 +245,7 @@ Respond with a JSON object:
 }
 
 // ---------------------------------------------------------------------------
-// TF-IDF convergence measurement (ported from packages/mirage/src/convergence.ts)
+// TF-IDF convergence measurement
 // ---------------------------------------------------------------------------
 
 function computeTF(text: string): Record<string, number> {
@@ -423,10 +337,11 @@ function measureConvergence(responses: AgentResponse[]): number {
 }
 
 // ---------------------------------------------------------------------------
-// Round summary generation
+// Round summary generation (uses cache)
 // ---------------------------------------------------------------------------
 
 async function generateRoundSummary(
+  ctx: any,
   responses: AgentResponse[],
   convergenceScore: number,
 ): Promise<string> {
@@ -450,9 +365,10 @@ ${positionsList}
 Provide a neutral, anonymous summary of this round's discussion.`;
 
   try {
-    const response = await llmComplete(systemPrompt, userPrompt, {
+    const response = await llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
       temperature: 0.3,
       maxTokens: 1024,
+      tags: ["round-summary"],
     });
     return response.content;
   } catch {
@@ -461,10 +377,11 @@ Provide a neutral, anonymous summary of this round's discussion.`;
 }
 
 // ---------------------------------------------------------------------------
-// Synthesis generation
+// Synthesis generation (uses cache)
 // ---------------------------------------------------------------------------
 
 async function generateSynthesis(
+  ctx: any,
   rounds: RoundData[],
   convergenceScore: number,
 ): Promise<{
@@ -486,7 +403,6 @@ async function generateSynthesis(
     )
     .join("\n\n");
 
-  // Determine resolution
   let resolution: string;
   if (convergenceScore >= 0.80) {
     resolution = "consensus";
@@ -529,10 +445,11 @@ Respond with this JSON structure:
   "quick_summary": "A single sentence summarizing the panel's verdict"
 }`;
 
-    const response = await llmComplete(systemPrompt, userPrompt, {
+    const response = await llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
       temperature: 0.3,
       maxTokens: 2048,
       jsonMode: true,
+      tags: ["synthesis"],
     });
 
     try {
@@ -606,6 +523,157 @@ async function sendWebhook(
 }
 
 // ---------------------------------------------------------------------------
+// Workpool-bounded agent call
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a single agent's LLM call with Workpool-style bounded concurrency.
+ * We implement bounded concurrency via a semaphore pattern since Workpool
+ * enqueues Convex functions (not inline promises). The actual parallelism
+ * is controlled by chunking agents into batches of 5.
+ */
+async function runAgentBatch(
+  ctx: any,
+  agents: ReturnType<typeof createReviewerAgents>,
+  agentIds: string[],
+  agentMeta: AgentMeta[],
+  roundNum: number,
+  maxRounds: number,
+  contentDescription: string,
+  imageUrl: string | undefined,
+  previousSummary: string | undefined,
+  previousResponses: AgentResponse[] | undefined,
+): Promise<AgentResponse[]> {
+  const MAX_PARALLEL = 5;
+  const responses: AgentResponse[] = [];
+
+  // Process agents in batches of MAX_PARALLEL
+  for (let batchStart = 0; batchStart < agents.length; batchStart += MAX_PARALLEL) {
+    const batchEnd = Math.min(batchStart + MAX_PARALLEL, agents.length);
+    const batchPromises: Promise<AgentResponse | null>[] = [];
+
+    for (let i = batchStart; i < batchEnd; i++) {
+      const agent = agents[i];
+      const agentId = agentIds[i];
+      const meta = agentMeta[i];
+
+      batchPromises.push(
+        (async (): Promise<AgentResponse | null> => {
+          try {
+            // Check per-review rate limit
+            const reviewLimit = await rateLimiter.limit(ctx, "reviewLlmCalls", {
+              key: agentId,
+            });
+            if (!reviewLimit.ok) {
+              console.warn(`[rate-limit] Per-review limit hit for agent ${meta.name}`);
+              return null;
+            }
+
+            // Check global rate limit
+            const globalLimit = await rateLimiter.limit(ctx, "globalLlmCalls");
+            if (!globalLimit.ok) {
+              console.warn(`[rate-limit] Global LLM limit hit`);
+              return null;
+            }
+
+            // Find own previous response
+            const ownPrevious = previousResponses?.find(
+              (r) => r.agentId === agentId,
+            );
+
+            const userPrompt = buildAgentUserPrompt(
+              roundNum,
+              maxRounds,
+              contentDescription,
+              roundNum === 1 ? imageUrl : undefined,
+              previousSummary,
+              ownPrevious
+                ? { stance: ownPrevious.stance, confidence: ownPrevious.confidence }
+                : undefined,
+            );
+
+            // Use Agent component's generateText for thread-managed conversation
+            const { threadId } = await agent.createThread(ctx, {
+              title: `Review agent ${meta.name} round ${roundNum}`,
+            });
+
+            const { thread } = await agent.continueThread(ctx, { threadId });
+
+            const result = await thread.generateText({
+              prompt: userPrompt,
+              temperature: 0.7,
+              maxOutputTokens: 2048,
+            });
+
+            const content = result.text || "";
+
+            // Parse the JSON response
+            let parsed: any;
+            try {
+              // Try to extract JSON from the response
+              const jsonMatch = content.match(/\{[\s\S]*\}/);
+              parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content);
+            } catch {
+              parsed = {
+                stance: content.slice(0, 200),
+                reasoning: content,
+                confidence: 0.5,
+                key_factors: [],
+                dissent_points: [],
+              };
+            }
+
+            return {
+              agentId,
+              agentName: meta.name,
+              reasoningStyle: meta.reasoningStyle,
+              stance:
+                parsed.stance ||
+                parsed.position_summary ||
+                parsed.summary ||
+                content.slice(0, 200),
+              reasoning: parsed.reasoning || parsed.analysis || content,
+              confidence:
+                typeof parsed.confidence === "number"
+                  ? Math.min(1, Math.max(0, parsed.confidence))
+                  : 0.5,
+              keyFactors: Array.isArray(parsed.key_factors) ? parsed.key_factors : [],
+              dissentPoints: Array.isArray(parsed.dissent_points)
+                ? parsed.dissent_points
+                : [],
+              influencedBy: parsed.influenced_by,
+              tokenUsage: {
+                input: result.usage?.inputTokens ?? 0,
+                output: result.usage?.outputTokens ?? 0,
+              },
+            };
+          } catch (error) {
+            console.warn(
+              `[review] Agent ${meta.name} failed in round ${roundNum}:`,
+              error instanceof Error ? error.message : error,
+            );
+            return null;
+          }
+        })(),
+      );
+    }
+
+    const batchResults = await Promise.all(batchPromises);
+    for (const result of batchResults) {
+      if (result !== null) {
+        responses.push(result);
+      }
+    }
+
+    console.log(
+      `[review] Batch ${Math.floor(batchStart / MAX_PARALLEL) + 1} complete: ${responses.length} responses so far`,
+    );
+  }
+
+  return responses;
+}
+
+// ---------------------------------------------------------------------------
 // Main deliberation action
 // ---------------------------------------------------------------------------
 
@@ -642,8 +710,34 @@ export const runDeliberation = internalAction({
     });
 
     try {
-      // --- Build panelists ---
-      const { panelists, agentMeta } = buildPanelists(agentCount);
+      // --- Rate limit check: workspace-level ---
+      const workspaceLimit = await rateLimiter.limit(ctx, "workspaceReviews", {
+        key: reviewId,
+      });
+      if (!workspaceLimit.ok) {
+        throw new Error(
+          `Workspace rate limit exceeded. Retry after ${workspaceLimit.retryAfter}ms`,
+        );
+      }
+
+      // --- Create agents using Agent component ---
+      const allAgents = createReviewerAgents();
+      const agents = allAgents.slice(0, Math.min(agentCount, allAgents.length));
+      const agentIds: string[] = [];
+      const agentMeta: AgentMeta[] = [];
+
+      for (let i = 0; i < agents.length; i++) {
+        const id = crypto.randomUUID();
+        const persona = getPersonaMeta(i);
+        agentIds.push(id);
+        agentMeta.push({
+          agentId: id,
+          name: persona.name,
+          reasoningStyle: persona.reasoningStyle,
+          persona: persona.persona.slice(0, 200),
+          confidence: 0,
+        });
+      }
 
       // Save agents to Convex
       await ctx.runMutation(internal.reviews.saveAgents, {
@@ -652,7 +746,7 @@ export const runDeliberation = internalAction({
       });
 
       console.log(
-        `[review] Starting deliberation ${reviewId}: ${agentCount} agents, ${maxRounds} rounds`,
+        `[review] Starting deliberation ${reviewId}: ${agents.length} agents, ${maxRounds} rounds (Agent component + Workpool batching + Rate Limiter + LLM Cache)`,
       );
 
       // --- Deliberation loop ---
@@ -662,87 +756,40 @@ export const runDeliberation = internalAction({
       for (let roundNum = 1; roundNum <= maxRounds; roundNum++) {
         console.log(`[review] Round ${roundNum}/${maxRounds} for ${reviewId}`);
 
-        // Generate summary from previous round
+        // Generate summary from previous round (cached)
         let previousSummary: string | undefined;
         if (roundsData.length > 0) {
           const lastRound = roundsData[roundsData.length - 1];
           previousSummary = await generateRoundSummary(
+            ctx,
             lastRound.responses,
             lastRound.convergenceScore,
           );
         }
 
-        // Collect responses concurrently from all agents
-        const responsePromises = panelists.map(async (panelist): Promise<AgentResponse | null> => {
-          try {
-            // Find own previous response
-            const ownPrevious = roundsData.length > 0
-              ? roundsData[roundsData.length - 1].responses.find(
-                  (r) => r.agentId === panelist.agentId,
-                )
-              : undefined;
+        // Collect responses using Workpool-bounded batching
+        const previousResponses =
+          roundsData.length > 0
+            ? roundsData[roundsData.length - 1].responses
+            : undefined;
 
-            const userPrompt = buildAgentUserPrompt(
-              roundNum,
-              maxRounds,
-              contentDescription,
-              // Only pass image on round 1
-              roundNum === 1 ? imageUrl : undefined,
-              previousSummary,
-              ownPrevious ? { stance: ownPrevious.stance, confidence: ownPrevious.confidence } : undefined,
-            );
-
-            const response = await llmComplete(panelist.systemPrompt, userPrompt, {
-              temperature: 0.7,
-              maxTokens: 2048,
-              jsonMode: true,
-              imageUrl: roundNum === 1 ? imageUrl : undefined,
-            });
-
-            // Parse the JSON response
-            let parsed: any;
-            try {
-              parsed = JSON.parse(response.content);
-            } catch {
-              parsed = {
-                stance: response.content.slice(0, 200),
-                reasoning: response.content,
-                confidence: 0.5,
-                key_factors: [],
-                dissent_points: [],
-              };
-            }
-
-            return {
-              agentId: panelist.agentId,
-              agentName: panelist.name,
-              reasoningStyle: panelist.reasoningStyle,
-              stance: parsed.stance || parsed.position_summary || parsed.summary || response.content.slice(0, 200),
-              reasoning: parsed.reasoning || parsed.analysis || response.content,
-              confidence: typeof parsed.confidence === "number"
-                ? Math.min(1, Math.max(0, parsed.confidence))
-                : 0.5,
-              keyFactors: Array.isArray(parsed.key_factors) ? parsed.key_factors : [],
-              dissentPoints: Array.isArray(parsed.dissent_points) ? parsed.dissent_points : [],
-              influencedBy: parsed.influenced_by,
-              tokenUsage: response.tokenUsage,
-            };
-          } catch (error) {
-            console.warn(
-              `[review] Agent ${panelist.name} failed in round ${roundNum}:`,
-              error instanceof Error ? error.message : error,
-            );
-            return null;
-          }
-        });
-
-        const settled = await Promise.all(responsePromises);
-        const responses = settled.filter((r): r is AgentResponse => r !== null);
+        const responses = await runAgentBatch(
+          ctx,
+          agents,
+          agentIds,
+          agentMeta,
+          roundNum,
+          maxRounds,
+          contentDescription,
+          imageUrl,
+          previousSummary,
+          previousResponses,
+        );
 
         // Check if we have enough responses
-        if (responses.length < panelists.length * 0.5) {
+        if (responses.length < agents.length * 0.5) {
           throw new Error(
-            `Only ${responses.length}/${panelists.length} agents responded in round ${roundNum}`,
+            `Only ${responses.length}/${agents.length} agents responded in round ${roundNum}`,
           );
         }
 
@@ -790,25 +837,30 @@ export const runDeliberation = internalAction({
         }
       }
 
-      // --- Synthesis ---
+      // --- Synthesis (cached) ---
       const finalRound = roundsData[roundsData.length - 1];
       const finalConvergence = finalRound?.convergenceScore ?? 0;
-      const synthesis = await generateSynthesis(roundsData, finalConvergence);
+      const synthesis = await generateSynthesis(ctx, roundsData, finalConvergence);
 
       // Compute agent journeys
-      const agentJourneys = panelists.map((panelist) => {
+      const agentJourneys = agents.map((_, i) => {
+        const agentId = agentIds[i];
+        const meta = agentMeta[i];
         const positions = roundsData
           .map((round) => {
-            const resp = round.responses.find((r) => r.agentId === panelist.agentId);
+            const resp = round.responses.find((r) => r.agentId === agentId);
             return resp
               ? { round: round.roundNumber, stance: resp.stance, confidence: resp.confidence }
               : null;
           })
-          .filter((p): p is { round: number; stance: string; confidence: number } => p !== null);
+          .filter(
+            (p): p is { round: number; stance: string; confidence: number } =>
+              p !== null,
+          );
 
         let stanceChanges = 0;
-        for (let i = 1; i < positions.length; i++) {
-          if (positions[i].stance !== positions[i - 1].stance) {
+        for (let k = 1; k < positions.length; k++) {
+          if (positions[k].stance !== positions[k - 1].stance) {
             stanceChanges++;
           }
         }
@@ -816,9 +868,9 @@ export const runDeliberation = internalAction({
         const consistencyScore = 1 - stanceChanges / maxChanges;
 
         return {
-          agentId: panelist.agentId,
-          agentName: panelist.name,
-          reasoningStyle: panelist.reasoningStyle,
+          agentId,
+          agentName: meta.name,
+          reasoningStyle: meta.reasoningStyle,
           finalStance: positions[positions.length - 1]?.stance || "",
           totalStanceChanges: stanceChanges,
           consistencyScore,
@@ -828,9 +880,11 @@ export const runDeliberation = internalAction({
 
       // Average confidence from final round
       const finalResponses = finalRound?.responses || [];
-      const avgConfidence = finalResponses.length > 0
-        ? finalResponses.reduce((s, r) => s + r.confidence, 0) / finalResponses.length
-        : 0.5;
+      const avgConfidence =
+        finalResponses.length > 0
+          ? finalResponses.reduce((s, r) => s + r.confidence, 0) /
+            finalResponses.length
+          : 0.5;
 
       // Save result to Convex
       await ctx.runMutation(internal.reviews.saveResult, {
@@ -892,7 +946,8 @@ export const runDeliberation = internalAction({
             reasoning_style: a.reasoningStyle,
             persona: a.persona,
             confidence:
-              finalResponses.find((r) => r.agentId === a.agentId)?.confidence ?? a.confidence,
+              finalResponses.find((r) => r.agentId === a.agentId)?.confidence ??
+              a.confidence,
           })),
           rounds_taken: roundsData.length,
           error: null,
