@@ -63,6 +63,12 @@ function getModelByName(modelName: string) {
 // Reviewer persona definitions (updated with model + temperature)
 // ---------------------------------------------------------------------------
 
+export interface ScoringDimension {
+  name: string;
+  description: string;
+  weight: number; // 0-1, weights within an agent sum to 1
+}
+
 export interface ReviewerPersona {
   name: string;
   persona: string;
@@ -70,6 +76,8 @@ export interface ReviewerPersona {
   reasoningDescription: string;
   model: ModelTier;
   temperature: number;
+  /** Domain-specific scoring dimensions — unique per persona */
+  dimensions: ScoringDimension[];
 }
 
 const REASONING_STYLES: Record<string, string> = {
@@ -98,6 +106,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["analytical"],
     model: "primary",
     temperature: 0.4,
+    dimensions: [
+      { name: "Personal Resonance", description: "Does this speak to me? Would I stop scrolling?", weight: 0.3 },
+      { name: "Purchase Intent", description: "Does this make me want to buy?", weight: 0.3 },
+      { name: "Shareability", description: "Would I share this with friends?", weight: 0.2 },
+      { name: "Relatability", description: "Does this feel authentic and relatable?", weight: 0.2 },
+    ],
   },
   {
     name: "Brand Critic",
@@ -107,6 +121,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["creative"],
     model: "secondary",
     temperature: 0.8,
+    dimensions: [
+      { name: "Brand Consistency", description: "Does this align with the brand's established identity?", weight: 0.3 },
+      { name: "Visual Identity", description: "Are brand elements (colors, style, tone) coherent?", weight: 0.25 },
+      { name: "Messaging Clarity", description: "Is the brand message clear and compelling?", weight: 0.25 },
+      { name: "Brand Equity Impact", description: "Does this strengthen or dilute the brand?", weight: 0.2 },
+    ],
   },
   {
     name: "Trend Analyst",
@@ -116,6 +136,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["skeptical"],
     model: "tertiary",
     temperature: 0.3,
+    dimensions: [
+      { name: "Cultural Relevance", description: "Does this tap into current cultural moments?", weight: 0.3 },
+      { name: "Trend Alignment", description: "Is this ahead of, on, or behind the trend curve?", weight: 0.3 },
+      { name: "Originality", description: "Is this a fresh take or a played-out trope?", weight: 0.2 },
+      { name: "Longevity", description: "Will this feel dated in 3 months?", weight: 0.2 },
+    ],
   },
   {
     name: "Marketing Expert",
@@ -125,6 +151,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["pragmatic"],
     model: "primary",
     temperature: 0.5,
+    dimensions: [
+      { name: "Conversion Potential", description: "Will this drive the desired action?", weight: 0.3 },
+      { name: "CTA Effectiveness", description: "Is the call-to-action clear and compelling?", weight: 0.25 },
+      { name: "Audience Targeting", description: "Does this reach the right audience segment?", weight: 0.25 },
+      { name: "Campaign Viability", description: "Can this scale as part of a broader campaign?", weight: 0.2 },
+    ],
   },
   {
     name: "Social Media User",
@@ -134,6 +166,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["synthesizing"],
     model: "secondary",
     temperature: 0.6,
+    dimensions: [
+      { name: "Scroll-Stop Power", description: "Would this make you stop scrolling in a busy feed?", weight: 0.3 },
+      { name: "Engagement Potential", description: "Would people like, comment, save this?", weight: 0.3 },
+      { name: "Platform Fit", description: "Does this feel native to the platform?", weight: 0.2 },
+      { name: "Comment-Worthiness", description: "Would this spark conversation?", weight: 0.2 },
+    ],
   },
   {
     name: "Creative Director",
@@ -143,6 +181,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["visionary"],
     model: "tertiary",
     temperature: 0.7,
+    dimensions: [
+      { name: "Composition", description: "Is the visual layout balanced and intentional?", weight: 0.25 },
+      { name: "Color & Tone", description: "Are the colors harmonious and mood-appropriate?", weight: 0.25 },
+      { name: "Visual Hierarchy", description: "Does the eye flow naturally to the key elements?", weight: 0.25 },
+      { name: "Production Quality", description: "Is the execution polished and professional?", weight: 0.25 },
+    ],
   },
   {
     name: "UX Designer",
@@ -152,6 +196,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["analytical"],
     model: "primary",
     temperature: 0.4,
+    dimensions: [
+      { name: "Clarity", description: "Can the message be understood in under 3 seconds?", weight: 0.3 },
+      { name: "Accessibility", description: "Is this accessible to people with disabilities?", weight: 0.25 },
+      { name: "Information Hierarchy", description: "Is the most important info most prominent?", weight: 0.25 },
+      { name: "Cognitive Load", description: "Is this easy to process or overwhelming?", weight: 0.2 },
+    ],
   },
   {
     name: "E-commerce Specialist",
@@ -161,6 +211,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["creative"],
     model: "secondary",
     temperature: 0.7,
+    dimensions: [
+      { name: "Product Presentation", description: "Is the product shown clearly and attractively?", weight: 0.3 },
+      { name: "Listing Readiness", description: "Could this go directly on a product listing page?", weight: 0.25 },
+      { name: "Desire Building", description: "Does this make you want to own the product?", weight: 0.25 },
+      { name: "Trust Signals", description: "Does this feel professional and trustworthy?", weight: 0.2 },
+    ],
   },
   {
     name: "Consumer Psychologist",
@@ -170,6 +226,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["skeptical"],
     model: "tertiary",
     temperature: 0.5,
+    dimensions: [
+      { name: "Emotional Resonance", description: "Does this evoke a strong emotional response?", weight: 0.3 },
+      { name: "Persuasion Strength", description: "How effectively does this influence decision-making?", weight: 0.25 },
+      { name: "Memorability", description: "Will someone remember this content tomorrow?", weight: 0.25 },
+      { name: "Trust & Authenticity", description: "Does this feel genuine or manipulative?", weight: 0.2 },
+    ],
   },
   {
     name: "Photographer",
@@ -179,6 +241,12 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
     reasoningDescription: REASONING_STYLES["pragmatic"],
     model: "primary",
     temperature: 0.5,
+    dimensions: [
+      { name: "Lighting", description: "Is the lighting professional, intentional, and flattering?", weight: 0.3 },
+      { name: "Composition & Framing", description: "Is the shot well-framed with good use of space?", weight: 0.25 },
+      { name: "Color Grading", description: "Are the colors natural/intentional and well-balanced?", weight: 0.25 },
+      { name: "Technical Quality", description: "Is focus, exposure, and depth of field correct?", weight: 0.2 },
+    ],
   },
 ];
 
@@ -187,6 +255,10 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
 // ---------------------------------------------------------------------------
 
 function buildInstructions(persona: ReviewerPersona): string {
+  const dimensionList = persona.dimensions
+    .map((d, i) => `${i + 1}. **${d.name}** (weight: ${Math.round(d.weight * 100)}%) - ${d.description}`)
+    .join("\n");
+
   return `# Your Role: ${persona.name}
 
 ${persona.persona}
@@ -194,19 +266,19 @@ ${persona.persona}
 ## Your Reasoning Style: ${persona.reasoningStyle}
 ${persona.reasoningDescription}
 
-## Evaluation Dimensions
-Score the content on these dimensions (1-10 each):
-1. **Visual Impact** - How visually striking and attention-grabbing is the content?
-2. **Brand Alignment** - How well does the content align with professional brand standards?
-3. **Audience Resonance** - How likely is the target audience to connect with this content?
-4. **Creativity** - How original and creative is the execution?
-5. **Effectiveness** - How well does the content achieve its apparent goal?
+## YOUR Scoring Dimensions
+These are YOUR specific evaluation dimensions. Score each from 1 to 10:
+${dimensionList}
+
+You MUST include a "scores" object in your response with a numeric score (1-10) for each dimension listed above. Use the exact dimension names as keys.
 
 ## Important Rules
 - Stay in character as ${persona.name} at all times
 - Apply your ${persona.reasoningStyle} reasoning style to your analysis
 - Be specific and reference concrete elements of the content
 - Provide honest, constructive feedback -- do not be uniformly positive or negative
+- Score each dimension independently based on YOUR expertise
+- A score of 5 is average. Be willing to give high scores (8-10) when genuinely deserved and low scores (1-3) when warranted
 - Your confidence score should reflect how certain you are of your assessment`;
 }
 

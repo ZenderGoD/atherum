@@ -65,6 +65,7 @@ const AgentResponseSchema = z.object({
   key_factors: z.array(z.string()).describe("Key supporting arguments"),
   dissent_points: z.array(z.string()).default([]).describe("Points of disagreement"),
   influenced_by: z.string().optional().describe("What changed from previous round"),
+  scores: z.record(z.string(), z.number().min(1).max(10)).default({}).describe("Per-dimension scores (1-10)"),
 });
 
 type ParsedAgentResponse = z.infer<typeof AgentResponseSchema>;
@@ -103,6 +104,7 @@ function safeParseAgentResponse(
       confidence: 0.5,
       key_factors: [],
       dissent_points: [],
+      scores: {},
     };
   }
 
@@ -135,6 +137,7 @@ function safeParseAgentResponse(
     key_factors: Array.isArray(obj.key_factors) ? obj.key_factors : [],
     dissent_points: Array.isArray(obj.dissent_points) ? obj.dissent_points : [],
     influenced_by: typeof obj.influenced_by === "string" ? obj.influenced_by : undefined,
+    scores: typeof obj.scores === "object" && obj.scores !== null ? obj.scores as Record<string, number> : {},
   };
 }
 
@@ -192,6 +195,7 @@ interface AgentResponse {
   keyFactors: string[];
   dissentPoints: string[];
   influencedBy?: string;
+  scores: Record<string, number>; // per-dimension scores (1-10)
   tokenUsage: { input: number; output: number };
 }
 
@@ -364,14 +368,18 @@ Respond with a JSON object:
   "reasoning": "Your detailed analysis and reasoning (2-4 paragraphs)",
   "confidence": <0.0 to 1.0>,
   "key_factors": ["factor1", "factor2", ...],
-  "dissent_points": ["disagreement1", ...]`;
+  "dissent_points": ["disagreement1", ...],
+  "scores": { "Dimension Name": <1-10>, ... }`;
 
   if (roundNumber > 1) {
     userPrompt += `,
   "influenced_by": "what changed from previous round (or 'maintained position')"`;
   }
 
-  userPrompt += "\n}";
+  userPrompt += `
+}
+
+IMPORTANT: The "scores" object MUST contain a numeric score (1-10) for EACH of your evaluation dimensions listed in your system prompt. Use the exact dimension names as keys.`;
 
   return userPrompt;
 }
@@ -933,6 +941,7 @@ async function runSingleAgent(
         keyFactors: parsed.key_factors,
         dissentPoints: parsed.dissent_points,
         influencedBy: parsed.influenced_by,
+        scores: parsed.scores || {},
         tokenUsage: {
           input: result.usage?.inputTokens ?? 0,
           output: result.usage?.outputTokens ?? 0,
@@ -1200,6 +1209,51 @@ export const runDeliberation = internalAction({
       const finalRound = roundsData[roundsData.length - 1];
       const finalConvergence = finalRound?.convergenceScore ?? 0;
       const synthesis = await generateSynthesis(ctx, roundsData, finalConvergence);
+
+      // --- Compute approval score from actual agent dimension scores ---
+      // This replaces the LLM-estimated score with a deterministic computation
+      const scoringResponses = finalRound?.responses || [];
+      let computedApprovalScore = synthesis.approvalScore; // fallback to LLM estimate
+
+      const allAgentScores: number[] = [];
+      for (let i = 0; i < scoringResponses.length; i++) {
+        const resp = scoringResponses[i];
+        const personaIndex = agentIds.indexOf(resp.agentId);
+        const persona = personaIndex >= 0 ? personas[personaIndex] : null;
+
+        if (resp.scores && Object.keys(resp.scores).length > 0 && persona) {
+          // Compute weighted score for this agent using their dimension weights
+          let weightedSum = 0;
+          let totalWeight = 0;
+          for (const dim of persona.dimensions) {
+            const score = resp.scores[dim.name];
+            if (typeof score === "number" && score >= 1 && score <= 10) {
+              weightedSum += score * dim.weight;
+              totalWeight += dim.weight;
+            }
+          }
+          if (totalWeight > 0) {
+            allAgentScores.push((weightedSum / totalWeight) * 10); // normalize to 0-100
+          }
+        }
+      }
+
+      if (allAgentScores.length >= Math.ceil(scoringResponses.length * 0.5)) {
+        // Have enough scored responses — use computed score
+        computedApprovalScore = Math.round(
+          allAgentScores.reduce((sum, s) => sum + s, 0) / allAgentScores.length
+        );
+        console.log(
+          `[review] Computed approval score from ${allAgentScores.length} agents' dimension scores: ${computedApprovalScore}/100`,
+        );
+      } else {
+        console.log(
+          `[review] Using LLM-estimated approval score: ${computedApprovalScore}/100 (only ${allAgentScores.length} agents returned dimension scores)`,
+        );
+      }
+
+      // Override the LLM estimate with the computed score
+      synthesis.approvalScore = computedApprovalScore;
 
       // Check if any round was partial
       const hadPartialRounds = roundsData.some((r) => r.partial);
