@@ -4,7 +4,8 @@
  * Atherum — Agent Definitions
  *
  * Defines 10 reviewer persona agents using the @convex-dev/agent component.
- * Each agent has a unique system prompt, reasoning style, and persona.
+ * Each agent has a unique system prompt, reasoning style, persona,
+ * preferred model tier, and temperature setting for multi-model diversity.
  * Uses the Vercel AI SDK with OpenRouter as the LLM provider.
  */
 
@@ -13,27 +14,53 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { components } from "./_generated/api";
 
 // ---------------------------------------------------------------------------
-// OpenRouter model via AI SDK OpenAI-compatible provider
+// Model pool — multi-model diversity (Priority 4)
 // ---------------------------------------------------------------------------
 
-function getModel() {
+export type ModelTier = "primary" | "secondary" | "tertiary";
+
+export const MODEL_POOL: Record<ModelTier, string> = {
+  primary:
+    process.env.LLM_MODEL_NAME || "google/gemini-2.5-flash-preview",
+  secondary:
+    process.env.LLM_MODEL_SECONDARY || "openai/gpt-4o-mini",
+  tertiary:
+    process.env.LLM_MODEL_TERTIARY || "anthropic/claude-3-haiku-20240307",
+};
+
+/**
+ * Model fallback chain for retry logic (Priority 2).
+ * When the primary model fails after retries, try the next in the chain.
+ */
+export const MODEL_FALLBACKS: string[] = [
+  MODEL_POOL.primary,
+  MODEL_POOL.secondary,
+  MODEL_POOL.tertiary,
+];
+
+function getModelForTier(tier: ModelTier) {
   const apiKey =
     process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || "";
   const baseURL =
     process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
-  const modelName =
-    process.env.LLM_MODEL_NAME || "google/gemini-2.5-flash-preview";
+  const modelName = MODEL_POOL[tier];
 
-  const openrouter = createOpenAI({
-    apiKey,
-    baseURL,
-  });
+  const openrouter = createOpenAI({ apiKey, baseURL });
+  return openrouter.chat(modelName);
+}
 
+function getModelByName(modelName: string) {
+  const apiKey =
+    process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || "";
+  const baseURL =
+    process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+
+  const openrouter = createOpenAI({ apiKey, baseURL });
   return openrouter.chat(modelName);
 }
 
 // ---------------------------------------------------------------------------
-// Reviewer persona definitions
+// Reviewer persona definitions (updated with model + temperature)
 // ---------------------------------------------------------------------------
 
 export interface ReviewerPersona {
@@ -41,6 +68,8 @@ export interface ReviewerPersona {
   persona: string;
   reasoningStyle: string;
   reasoningDescription: string;
+  model: ModelTier;
+  temperature: number;
 }
 
 const REASONING_STYLES: Record<string, string> = {
@@ -67,6 +96,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a typical member of the target audience. You evaluate content based on whether it resonates with you personally, whether you would engage with it, share it, or scroll past it. You represent the everyday consumer's perspective.",
     reasoningStyle: "analytical",
     reasoningDescription: REASONING_STYLES["analytical"],
+    model: "primary",
+    temperature: 0.4,
   },
   {
     name: "Brand Critic",
@@ -74,6 +105,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a sharp brand critic with deep knowledge of brand strategy. You evaluate whether content aligns with brand identity, maintains consistency, and strengthens brand equity. You notice when brands stray from their core values.",
     reasoningStyle: "creative",
     reasoningDescription: REASONING_STYLES["creative"],
+    model: "secondary",
+    temperature: 0.8,
   },
   {
     name: "Trend Analyst",
@@ -81,6 +114,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a cultural trend analyst who tracks emerging patterns in media, fashion, technology, and social behavior. You evaluate content based on its cultural relevance, timeliness, and alignment with current or emerging trends.",
     reasoningStyle: "skeptical",
     reasoningDescription: REASONING_STYLES["skeptical"],
+    model: "tertiary",
+    temperature: 0.3,
   },
   {
     name: "Marketing Expert",
@@ -88,6 +123,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a seasoned marketing professional with expertise in campaign strategy, audience segmentation, and performance metrics. You evaluate content based on its potential to drive engagement, conversions, and measurable business outcomes.",
     reasoningStyle: "pragmatic",
     reasoningDescription: REASONING_STYLES["pragmatic"],
+    model: "primary",
+    temperature: 0.5,
   },
   {
     name: "Social Media User",
@@ -95,6 +132,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are an active social media user who spends significant time on Instagram, TikTok, and other platforms. You evaluate content based on its scroll-stopping power, shareability, and how it compares to what performs well in your feed.",
     reasoningStyle: "synthesizing",
     reasoningDescription: REASONING_STYLES["synthesizing"],
+    model: "secondary",
+    temperature: 0.6,
   },
   {
     name: "Creative Director",
@@ -102,6 +141,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a creative director with years of experience leading visual campaigns. You evaluate content on craft quality -- composition, color theory, typography, visual hierarchy, and overall creative execution. You have high standards.",
     reasoningStyle: "visionary",
     reasoningDescription: REASONING_STYLES["visionary"],
+    model: "tertiary",
+    temperature: 0.7,
   },
   {
     name: "UX Designer",
@@ -109,6 +150,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a UX designer focused on user experience and interaction design. You evaluate content based on clarity, accessibility, readability, and how well it communicates its intended message to diverse audiences.",
     reasoningStyle: "analytical",
     reasoningDescription: REASONING_STYLES["analytical"],
+    model: "primary",
+    temperature: 0.4,
   },
   {
     name: "E-commerce Specialist",
@@ -116,6 +159,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are an e-commerce specialist who understands what drives purchase decisions. You evaluate content based on its ability to showcase products effectively, build desire, and move consumers toward purchase.",
     reasoningStyle: "creative",
     reasoningDescription: REASONING_STYLES["creative"],
+    model: "secondary",
+    temperature: 0.7,
   },
   {
     name: "Consumer Psychologist",
@@ -123,6 +168,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a consumer psychologist who studies decision-making, emotional responses, and behavioral triggers. You evaluate content based on its psychological impact -- emotional resonance, cognitive load, persuasion techniques, and memorability.",
     reasoningStyle: "skeptical",
     reasoningDescription: REASONING_STYLES["skeptical"],
+    model: "tertiary",
+    temperature: 0.5,
   },
   {
     name: "Photographer",
@@ -130,6 +177,8 @@ export const REVIEWER_PERSONAS: ReviewerPersona[] = [
       "You are a professional photographer and visual artist. You evaluate content on technical and artistic merit -- lighting, composition, color grading, focus, and visual storytelling. You appreciate both commercial and artistic photography.",
     reasoningStyle: "pragmatic",
     reasoningDescription: REASONING_STYLES["pragmatic"],
+    model: "primary",
+    temperature: 0.5,
   },
 ];
 
@@ -162,20 +211,32 @@ Score the content on these dimensions (1-10 each):
 }
 
 // ---------------------------------------------------------------------------
-// Create Agent instances
+// Create Agent instances (now model-per-agent via Priority 4)
 // ---------------------------------------------------------------------------
 
 export function createReviewerAgents(): Agent[] {
-  const model = getModel();
-
   return REVIEWER_PERSONAS.map(
     (persona) =>
       new Agent(components.agent, {
         name: persona.name,
-        languageModel: model,
+        languageModel: getModelForTier(persona.model),
         instructions: buildInstructions(persona),
       }),
   );
+}
+
+/**
+ * Create an Agent with a specific model name (used for fallback chains).
+ */
+export function createAgentWithModel(
+  persona: ReviewerPersona,
+  modelName: string,
+): Agent {
+  return new Agent(components.agent, {
+    name: persona.name,
+    languageModel: getModelByName(modelName),
+    instructions: buildInstructions(persona),
+  });
 }
 
 /**

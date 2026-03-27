@@ -3,7 +3,13 @@
 /**
  * Atherum — Deliberation Action (Convex Node.js runtime)
  *
- * Rewritten to integrate five Convex components:
+ * Hardened with priorities 1-4 from the engineering roadmap:
+ *   P1: Structured output with Zod validation + field-level defaults
+ *   P2: Per-agent retry with exponential backoff + model fallback chain
+ *   P3: Embedding-based convergence (with TF-IDF fallback)
+ *   P4: Multi-model agent diversity (per-agent model + temperature)
+ *
+ * Integrates five Convex components:
  *   1. @convex-dev/agent — Agent definitions, thread management, generateText
  *   2. @convex-dev/rate-limiter — Per-workspace, per-review, and global limits
  *   3. @convex-dev/workpool — Bounded concurrent LLM calls (max 5 parallel)
@@ -14,7 +20,7 @@
  *   1. Check rate limits
  *   2. Create agents and threads via Agent component
  *   3. Run rounds using Workpool-bounded parallelism with LLM Cache
- *   4. Measure convergence (TF-IDF cosine similarity)
+ *   4. Measure convergence (embedding-based with TF-IDF fallback)
  *   5. Synthesize final verdict
  *   6. Persist everything via mutations
  *   7. Send webhook callback
@@ -23,7 +29,14 @@
 import { v } from "convex/values";
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { createReviewerAgents, getPersonaMeta, REVIEWER_PERSONAS } from "./agents";
+import {
+  createReviewerAgents,
+  createAgentWithModel,
+  getPersonaMeta,
+  REVIEWER_PERSONAS,
+  MODEL_FALLBACKS,
+} from "./agents";
+import type { ReviewerPersona } from "./agents";
 import { rateLimiter } from "./rateLimiter";
 import { LLMCache } from "@mzedstudio/llm-cache";
 import { components } from "./_generated/api";
@@ -33,12 +46,122 @@ import type {
   ChatCompletionMessageParam,
   ChatCompletionContentPart,
 } from "openai/resources/chat/completions";
+import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // LLM Cache instance
 // ---------------------------------------------------------------------------
 
 const llmCache = new LLMCache(components.llmCache);
+
+// ---------------------------------------------------------------------------
+// Priority 1: Zod schemas for structured output
+// ---------------------------------------------------------------------------
+
+const AgentResponseSchema = z.object({
+  stance: z.string().describe("Your overall position in 2-3 sentences"),
+  reasoning: z.string().describe("Detailed analysis, 2-4 paragraphs"),
+  confidence: z.number().min(0).max(1).describe("How certain you are"),
+  key_factors: z.array(z.string()).describe("Key supporting arguments"),
+  dissent_points: z.array(z.string()).default([]).describe("Points of disagreement"),
+  influenced_by: z.string().optional().describe("What changed from previous round"),
+});
+
+type ParsedAgentResponse = z.infer<typeof AgentResponseSchema>;
+
+const SynthesisSchema = z.object({
+  winning_position: z.string().describe("The dominant consensus position in 2-3 sentences"),
+  consensus_summary: z.string().describe("A brief synthesis of what the panel agreed on"),
+  key_agreements: z.array(z.string()).describe("Points of agreement"),
+  remaining_dissent: z.array(z.string()).default([]).describe("Points of disagreement"),
+  minority_report: z.string().default("").describe("Summary of minority/dissenting views"),
+  approval_score: z.number().min(0).max(100).describe("Overall approval of the content"),
+  quick_summary: z.string().describe("A single sentence summarizing the panel's verdict"),
+});
+
+/**
+ * Safely parse a JSON string against a Zod schema with field-level defaults.
+ * On parse failure: returns field-level defaults for missing fields rather than
+ * rejecting the whole response.
+ */
+function safeParseAgentResponse(
+  content: string,
+  fallbackContent: string,
+): ParsedAgentResponse {
+  // Try to extract JSON from the response
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  const jsonStr = jsonMatch ? jsonMatch[0] : content;
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(jsonStr);
+  } catch {
+    // Not valid JSON at all — use raw content as stance/reasoning
+    return {
+      stance: fallbackContent.slice(0, 200),
+      reasoning: fallbackContent,
+      confidence: 0.5,
+      key_factors: [],
+      dissent_points: [],
+    };
+  }
+
+  const result = AgentResponseSchema.safeParse(raw);
+  if (result.success) {
+    return result.data;
+  }
+
+  // Field-level fallback: take what we can from the raw object, fill defaults
+  const obj = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  return {
+    stance:
+      typeof obj.stance === "string"
+        ? obj.stance
+        : typeof obj.position_summary === "string"
+          ? obj.position_summary
+          : typeof obj.summary === "string"
+            ? obj.summary
+            : fallbackContent.slice(0, 200),
+    reasoning:
+      typeof obj.reasoning === "string"
+        ? obj.reasoning
+        : typeof obj.analysis === "string"
+          ? obj.analysis
+          : fallbackContent,
+    confidence:
+      typeof obj.confidence === "number"
+        ? Math.min(1, Math.max(0, obj.confidence))
+        : 0.5,
+    key_factors: Array.isArray(obj.key_factors) ? obj.key_factors : [],
+    dissent_points: Array.isArray(obj.dissent_points) ? obj.dissent_points : [],
+    influenced_by: typeof obj.influenced_by === "string" ? obj.influenced_by : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Priority 2: Retry wrapper with exponential backoff
+// ---------------------------------------------------------------------------
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  retries = 2,
+  baseDelay = 1000,
+): Promise<T> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const delay = baseDelay * Math.pow(3, attempt); // 1s, 3s, 9s
+      console.warn(
+        `[retry] Attempt ${attempt + 1} failed, retrying in ${delay}ms:`,
+        err instanceof Error ? err.message : err,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw new Error("unreachable");
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -70,16 +193,17 @@ interface RoundData {
   responses: AgentResponse[];
   convergenceScore: number;
   summary?: string;
+  partial?: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // LLM client helpers (kept for synthesis + round summary which don't use Agent)
 // ---------------------------------------------------------------------------
 
-function getLLMClient(): { client: OpenAI; model: string } {
+function getLLMClient(modelOverride?: string): { client: OpenAI; model: string } {
   const apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || "";
   const baseURL = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
-  const model = process.env.LLM_MODEL_NAME || "google/gemini-2.5-flash-preview";
+  const model = modelOverride || process.env.LLM_MODEL_NAME || "google/gemini-2.5-flash-preview";
 
   const client = new OpenAI({ apiKey, baseURL });
   return { client, model };
@@ -95,9 +219,10 @@ async function llmCompleteWithCache(
     jsonMode?: boolean;
     imageUrl?: string;
     tags?: string[];
+    modelOverride?: string;
   },
 ): Promise<{ content: string; tokenUsage: { input: number; output: number }; cached: boolean }> {
-  const { client, model } = getLLMClient();
+  const { client, model } = getLLMClient(options?.modelOverride);
 
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: systemPrompt },
@@ -245,8 +370,62 @@ Respond with a JSON object:
 }
 
 // ---------------------------------------------------------------------------
-// TF-IDF convergence measurement
+// Priority 3: Embedding-based convergence measurement
 // ---------------------------------------------------------------------------
+
+/**
+ * Embed texts using the OpenAI-compatible embeddings API.
+ * Falls back gracefully if the embedding call fails.
+ */
+async function embedTexts(texts: string[]): Promise<number[][] | null> {
+  try {
+    const { client } = getLLMClient();
+    const response = await client.embeddings.create({
+      model: "text-embedding-3-small",
+      input: texts,
+    });
+    return response.data.map((d) => d.embedding);
+  } catch (err) {
+    console.warn(
+      "[embeddings] Embedding call failed, falling back to TF-IDF:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+}
+
+/**
+ * Compute cosine similarity between two embedding vectors.
+ */
+function embeddingCosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+/**
+ * Compute mean pairwise cosine similarity from embedding vectors.
+ */
+function embeddingMeanSimilarity(embeddings: number[][]): number {
+  let totalSim = 0;
+  let pairs = 0;
+  for (let i = 0; i < embeddings.length; i++) {
+    for (let j = i + 1; j < embeddings.length; j++) {
+      totalSim += embeddingCosineSimilarity(embeddings[i], embeddings[j]);
+      pairs++;
+    }
+  }
+  return pairs > 0 ? totalSim / pairs : 1;
+}
+
+// --- TF-IDF fallback (kept from original) ---
 
 function computeTF(text: string): Record<string, number> {
   const words = text
@@ -317,7 +496,7 @@ function cosineSimilarity(a: Map<string, number>, b: Map<string, number>): numbe
   return dotProduct / denominator;
 }
 
-function measureConvergence(responses: AgentResponse[]): number {
+function measureConvergenceTFIDF(responses: AgentResponse[]): number {
   const documents = responses.map((r) => r.stance);
   const termFreqs = documents.map(computeTF);
   const idf = computeIDF(termFreqs);
@@ -334,6 +513,61 @@ function measureConvergence(responses: AgentResponse[]): number {
   }
 
   return pairs > 0 ? totalSim / pairs : 1;
+}
+
+/**
+ * Multi-dimensional convergence measurement (Priority 3).
+ *
+ * Combines:
+ *   - Semantic similarity (embeddings or TF-IDF fallback)  weight: 0.50
+ *   - Score agreement (inverse std dev of confidence)       weight: 0.25
+ *   - Direction agreement (% agents on same side of 0.5)    weight: 0.25
+ */
+async function measureConvergence(responses: AgentResponse[]): Promise<number> {
+  if (responses.length <= 1) return 1;
+
+  // --- Dimension 1: Semantic similarity ---
+  let semanticSimilarity: number;
+  const stances = responses.map((r) => r.stance);
+  const embeddings = await embedTexts(stances);
+
+  if (embeddings && embeddings.length === stances.length) {
+    semanticSimilarity = embeddingMeanSimilarity(embeddings);
+    console.log(`[convergence] Embedding similarity: ${semanticSimilarity.toFixed(3)}`);
+  } else {
+    semanticSimilarity = measureConvergenceTFIDF(responses);
+    console.log(`[convergence] TF-IDF fallback similarity: ${semanticSimilarity.toFixed(3)}`);
+  }
+
+  // --- Dimension 2: Score agreement (inverse of confidence std dev) ---
+  const confidences = responses.map((r) => r.confidence);
+  const meanConf = confidences.reduce((a, b) => a + b, 0) / confidences.length;
+  const variance =
+    confidences.reduce((sum, c) => sum + (c - meanConf) ** 2, 0) / confidences.length;
+  const stdDev = Math.sqrt(variance);
+  // stdDev ranges 0..0.5 for values in [0,1]; normalize to [0,1] agreement
+  const scoreAgreement = 1 - Math.min(stdDev / 0.5, 1);
+
+  // --- Dimension 3: Direction agreement (% on same side of 0.5) ---
+  const above = confidences.filter((c) => c >= 0.5).length;
+  const below = confidences.length - above;
+  const majorityFraction = Math.max(above, below) / confidences.length;
+  // Already in [0.5, 1.0] range; normalize to [0, 1]
+  const directionAgreement = (majorityFraction - 0.5) * 2;
+
+  // --- Weighted combination ---
+  const combined =
+    semanticSimilarity * 0.50 +
+    scoreAgreement * 0.25 +
+    directionAgreement * 0.25;
+
+  console.log(
+    `[convergence] Multi-dimensional: semantic=${semanticSimilarity.toFixed(3)} ` +
+      `score=${scoreAgreement.toFixed(3)} direction=${directionAgreement.toFixed(3)} ` +
+      `combined=${combined.toFixed(3)}`,
+  );
+
+  return combined;
 }
 
 // ---------------------------------------------------------------------------
@@ -365,11 +599,13 @@ ${positionsList}
 Provide a neutral, anonymous summary of this round's discussion.`;
 
   try {
-    const response = await llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
-      temperature: 0.3,
-      maxTokens: 1024,
-      tags: ["round-summary"],
-    });
+    const response = await withRetry(() =>
+      llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
+        temperature: 0.3,
+        maxTokens: 1024,
+        tags: ["round-summary"],
+      }),
+    );
     return response.content;
   } catch {
     return `Round summary (${responses.length} reviewers, convergence: ${convergenceScore.toFixed(2)}): Key themes discussed include the overall quality and effectiveness of the content.`;
@@ -377,7 +613,7 @@ Provide a neutral, anonymous summary of this round's discussion.`;
 }
 
 // ---------------------------------------------------------------------------
-// Synthesis generation (uses cache)
+// Synthesis generation (uses cache + Zod validation)
 // ---------------------------------------------------------------------------
 
 async function generateSynthesis(
@@ -445,23 +681,41 @@ Respond with this JSON structure:
   "quick_summary": "A single sentence summarizing the panel's verdict"
 }`;
 
-    const response = await llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
-      temperature: 0.3,
-      maxTokens: 2048,
-      jsonMode: true,
-      tags: ["synthesis"],
-    });
+    const response = await withRetry(() =>
+      llmCompleteWithCache(ctx, systemPrompt, userPrompt, {
+        temperature: 0.3,
+        maxTokens: 2048,
+        jsonMode: true,
+        tags: ["synthesis"],
+      }),
+    );
 
     try {
-      const parsed = JSON.parse(response.content);
+      const raw = JSON.parse(response.content);
+      const parsed = SynthesisSchema.safeParse(raw);
+
+      if (parsed.success) {
+        return {
+          winningPosition: parsed.data.winning_position,
+          consensusSummary: parsed.data.consensus_summary,
+          keyAgreements: parsed.data.key_agreements,
+          remainingDissent: parsed.data.remaining_dissent,
+          minorityReport: parsed.data.minority_report,
+          approvalScore: parsed.data.approval_score,
+          quickSummary: parsed.data.quick_summary,
+        };
+      }
+
+      // Field-level fallback on Zod validation failure
+      console.warn("[synthesis] Zod validation failed, using field-level fallback:", parsed.error.message);
       return {
-        winningPosition: parsed.winning_position || defaultResult.winningPosition,
-        consensusSummary: parsed.consensus_summary || defaultResult.consensusSummary,
-        keyAgreements: Array.isArray(parsed.key_agreements) ? parsed.key_agreements : [],
-        remainingDissent: Array.isArray(parsed.remaining_dissent) ? parsed.remaining_dissent : [],
-        minorityReport: parsed.minority_report || "",
-        approvalScore: typeof parsed.approval_score === "number" ? parsed.approval_score : 50,
-        quickSummary: parsed.quick_summary || defaultResult.quickSummary,
+        winningPosition: raw.winning_position || defaultResult.winningPosition,
+        consensusSummary: raw.consensus_summary || defaultResult.consensusSummary,
+        keyAgreements: Array.isArray(raw.key_agreements) ? raw.key_agreements : [],
+        remainingDissent: Array.isArray(raw.remaining_dissent) ? raw.remaining_dissent : [],
+        minorityReport: raw.minority_report || "",
+        approvalScore: typeof raw.approval_score === "number" ? raw.approval_score : 50,
+        quickSummary: raw.quick_summary || defaultResult.quickSummary,
       };
     } catch {
       return defaultResult;
@@ -523,18 +777,185 @@ async function sendWebhook(
 }
 
 // ---------------------------------------------------------------------------
-// Workpool-bounded agent call
+// Workpool-bounded agent call (Priority 2: retry + model fallback)
 // ---------------------------------------------------------------------------
 
 /**
- * Runs a single agent's LLM call with Workpool-style bounded concurrency.
- * We implement bounded concurrency via a semaphore pattern since Workpool
- * enqueues Convex functions (not inline promises). The actual parallelism
- * is controlled by chunking agents into batches of 5.
+ * Runs a single agent's LLM call with retry and model fallback.
+ * On failure after retries with the agent's primary model, tries the
+ * next models in the fallback chain.
+ */
+async function runSingleAgent(
+  ctx: any,
+  agent: ReturnType<typeof createReviewerAgents>[number],
+  persona: ReviewerPersona,
+  agentId: string,
+  meta: AgentMeta,
+  roundNum: number,
+  maxRounds: number,
+  contentDescription: string,
+  imageUrl: string | undefined,
+  previousSummary: string | undefined,
+  previousResponses: AgentResponse[] | undefined,
+): Promise<AgentResponse | null> {
+  // Check per-review rate limit
+  const reviewLimit = await rateLimiter.limit(ctx, "reviewLlmCalls", {
+    key: agentId,
+  });
+  if (!reviewLimit.ok) {
+    console.warn(`[rate-limit] Per-review limit hit for agent ${meta.name}`);
+    return null;
+  }
+
+  // Check global rate limit
+  const globalLimit = await rateLimiter.limit(ctx, "globalLlmCalls");
+  if (!globalLimit.ok) {
+    console.warn(`[rate-limit] Global LLM limit hit`);
+    return null;
+  }
+
+  // Find own previous response
+  const ownPrevious = previousResponses?.find((r) => r.agentId === agentId);
+
+  const userPrompt = buildAgentUserPrompt(
+    roundNum,
+    maxRounds,
+    contentDescription,
+    roundNum === 1 ? imageUrl : undefined,
+    previousSummary,
+    ownPrevious
+      ? { stance: ownPrevious.stance, confidence: ownPrevious.confidence }
+      : undefined,
+  );
+
+  // Build the model fallback chain starting from the agent's assigned model
+  const assignedModel = persona.model;
+  const assignedModelName =
+    assignedModel === "primary"
+      ? MODEL_FALLBACKS[0]
+      : assignedModel === "secondary"
+        ? MODEL_FALLBACKS[1]
+        : MODEL_FALLBACKS[2];
+
+  // Create ordered fallback list: assigned model first, then others
+  const fallbackChain = [
+    assignedModelName,
+    ...MODEL_FALLBACKS.filter((m) => m !== assignedModelName),
+  ];
+
+  let lastError: Error | null = null;
+  let visionFailed = false;
+
+  for (const modelName of fallbackChain) {
+    try {
+      // Build the agent for this model
+      const currentAgent =
+        modelName === assignedModelName
+          ? agent
+          : createAgentWithModel(persona, modelName);
+
+      const result = await withRetry(async () => {
+        const { threadId } = await currentAgent.createThread(ctx, {
+          title: `Review agent ${meta.name} round ${roundNum}`,
+        });
+
+        const { thread } = await currentAgent.continueThread(ctx, { threadId });
+
+        // Build prompt, handling vision fallback
+        let promptToSend = userPrompt;
+        if (visionFailed && roundNum === 1 && imageUrl) {
+          promptToSend =
+            "Note: image could not be analyzed, review based on description only.\n\n" +
+            promptToSend;
+        }
+
+        return await thread.generateText({
+          prompt: promptToSend,
+          temperature: persona.temperature,
+          maxOutputTokens: 2048,
+        });
+      });
+
+      const content = result.text || "";
+
+      // Parse with Zod (Priority 1)
+      let parsed = safeParseAgentResponse(content, content);
+
+      // If parsing got poor results (empty stance from fallback), try a JSON nudge retry
+      if (parsed.stance === content.slice(0, 200) && content.length > 50) {
+        try {
+          const { threadId: retryThreadId } = await agent.createThread(ctx, {
+            title: `Review agent ${meta.name} round ${roundNum} (JSON retry)`,
+          });
+          const { thread: retryThread } = await agent.continueThread(ctx, {
+            threadId: retryThreadId,
+          });
+          const retryResult = await retryThread.generateText({
+            prompt:
+              "Your previous response was not in valid JSON format. Please respond ONLY with a valid JSON object matching this schema:\n" +
+              '{"stance": "...", "reasoning": "...", "confidence": 0.0-1.0, "key_factors": [...], "dissent_points": [...]}\n\n' +
+              "Original question:\n" +
+              userPrompt,
+            temperature: persona.temperature,
+            maxOutputTokens: 2048,
+          });
+          const retryContent = retryResult.text || "";
+          const retryParsed = safeParseAgentResponse(retryContent, content);
+          // Use retry result if it has a proper stance
+          if (retryParsed.stance !== retryContent.slice(0, 200)) {
+            parsed = retryParsed;
+          }
+        } catch {
+          // JSON nudge retry failed, keep original parsed result
+        }
+      }
+
+      return {
+        agentId,
+        agentName: meta.name,
+        reasoningStyle: meta.reasoningStyle,
+        stance: parsed.stance,
+        reasoning: parsed.reasoning,
+        confidence: parsed.confidence,
+        keyFactors: parsed.key_factors,
+        dissentPoints: parsed.dissent_points,
+        influencedBy: parsed.influenced_by,
+        tokenUsage: {
+          input: result.usage?.inputTokens ?? 0,
+          output: result.usage?.outputTokens ?? 0,
+        },
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      console.warn(
+        `[review] Agent ${meta.name} failed with model ${modelName}:`,
+        lastError.message,
+      );
+
+      // Priority 2: Vision fallback — if round 1 with image, retry without image
+      if (roundNum === 1 && imageUrl && !visionFailed) {
+        console.warn(`[review] Enabling vision fallback for agent ${meta.name}`);
+        visionFailed = true;
+        // Continue to next model in fallback chain (vision flag is now set)
+      }
+    }
+  }
+
+  console.warn(
+    `[review] Agent ${meta.name} exhausted all model fallbacks in round ${roundNum}:`,
+    lastError?.message,
+  );
+  return null;
+}
+
+/**
+ * Runs all agents in batches with bounded concurrency.
+ * Returns responses and a partial flag if not all agents responded.
  */
 async function runAgentBatch(
   ctx: any,
   agents: ReturnType<typeof createReviewerAgents>,
+  personas: ReviewerPersona[],
   agentIds: string[],
   agentMeta: AgentMeta[],
   roundNum: number,
@@ -543,7 +964,7 @@ async function runAgentBatch(
   imageUrl: string | undefined,
   previousSummary: string | undefined,
   previousResponses: AgentResponse[] | undefined,
-): Promise<AgentResponse[]> {
+): Promise<{ responses: AgentResponse[]; partial: boolean }> {
   const MAX_PARALLEL = 5;
   const responses: AgentResponse[] = [];
 
@@ -553,108 +974,20 @@ async function runAgentBatch(
     const batchPromises: Promise<AgentResponse | null>[] = [];
 
     for (let i = batchStart; i < batchEnd; i++) {
-      const agent = agents[i];
-      const agentId = agentIds[i];
-      const meta = agentMeta[i];
-
       batchPromises.push(
-        (async (): Promise<AgentResponse | null> => {
-          try {
-            // Check per-review rate limit
-            const reviewLimit = await rateLimiter.limit(ctx, "reviewLlmCalls", {
-              key: agentId,
-            });
-            if (!reviewLimit.ok) {
-              console.warn(`[rate-limit] Per-review limit hit for agent ${meta.name}`);
-              return null;
-            }
-
-            // Check global rate limit
-            const globalLimit = await rateLimiter.limit(ctx, "globalLlmCalls");
-            if (!globalLimit.ok) {
-              console.warn(`[rate-limit] Global LLM limit hit`);
-              return null;
-            }
-
-            // Find own previous response
-            const ownPrevious = previousResponses?.find(
-              (r) => r.agentId === agentId,
-            );
-
-            const userPrompt = buildAgentUserPrompt(
-              roundNum,
-              maxRounds,
-              contentDescription,
-              roundNum === 1 ? imageUrl : undefined,
-              previousSummary,
-              ownPrevious
-                ? { stance: ownPrevious.stance, confidence: ownPrevious.confidence }
-                : undefined,
-            );
-
-            // Use Agent component's generateText for thread-managed conversation
-            const { threadId } = await agent.createThread(ctx, {
-              title: `Review agent ${meta.name} round ${roundNum}`,
-            });
-
-            const { thread } = await agent.continueThread(ctx, { threadId });
-
-            const result = await thread.generateText({
-              prompt: userPrompt,
-              temperature: 0.7,
-              maxOutputTokens: 2048,
-            });
-
-            const content = result.text || "";
-
-            // Parse the JSON response
-            let parsed: any;
-            try {
-              // Try to extract JSON from the response
-              const jsonMatch = content.match(/\{[\s\S]*\}/);
-              parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content);
-            } catch {
-              parsed = {
-                stance: content.slice(0, 200),
-                reasoning: content,
-                confidence: 0.5,
-                key_factors: [],
-                dissent_points: [],
-              };
-            }
-
-            return {
-              agentId,
-              agentName: meta.name,
-              reasoningStyle: meta.reasoningStyle,
-              stance:
-                parsed.stance ||
-                parsed.position_summary ||
-                parsed.summary ||
-                content.slice(0, 200),
-              reasoning: parsed.reasoning || parsed.analysis || content,
-              confidence:
-                typeof parsed.confidence === "number"
-                  ? Math.min(1, Math.max(0, parsed.confidence))
-                  : 0.5,
-              keyFactors: Array.isArray(parsed.key_factors) ? parsed.key_factors : [],
-              dissentPoints: Array.isArray(parsed.dissent_points)
-                ? parsed.dissent_points
-                : [],
-              influencedBy: parsed.influenced_by,
-              tokenUsage: {
-                input: result.usage?.inputTokens ?? 0,
-                output: result.usage?.outputTokens ?? 0,
-              },
-            };
-          } catch (error) {
-            console.warn(
-              `[review] Agent ${meta.name} failed in round ${roundNum}:`,
-              error instanceof Error ? error.message : error,
-            );
-            return null;
-          }
-        })(),
+        runSingleAgent(
+          ctx,
+          agents[i],
+          personas[i],
+          agentIds[i],
+          agentMeta[i],
+          roundNum,
+          maxRounds,
+          contentDescription,
+          imageUrl,
+          previousSummary,
+          previousResponses,
+        ),
       );
     }
 
@@ -670,7 +1003,9 @@ async function runAgentBatch(
     );
   }
 
-  return responses;
+  // Priority 2: Partial results — lowered threshold from 50% to 30%
+  const partial = responses.length < agents.length;
+  return { responses, partial };
 }
 
 // ---------------------------------------------------------------------------
@@ -720,9 +1055,10 @@ export const runDeliberation = internalAction({
         );
       }
 
-      // --- Create agents using Agent component ---
+      // --- Create agents using Agent component (Priority 4: per-agent model) ---
       const allAgents = createReviewerAgents();
       const agents = allAgents.slice(0, Math.min(agentCount, allAgents.length));
+      const personas = REVIEWER_PERSONAS.slice(0, agents.length);
       const agentIds: string[] = [];
       const agentMeta: AgentMeta[] = [];
 
@@ -746,12 +1082,14 @@ export const runDeliberation = internalAction({
       });
 
       console.log(
-        `[review] Starting deliberation ${reviewId}: ${agents.length} agents, ${maxRounds} rounds (Agent component + Workpool batching + Rate Limiter + LLM Cache)`,
+        `[review] Starting deliberation ${reviewId}: ${agents.length} agents, ${maxRounds} rounds ` +
+          `(Zod validation + retry/fallback + embedding convergence + multi-model diversity)`,
       );
 
       // --- Deliberation loop ---
       const roundsData: RoundData[] = [];
       const CONVERGENCE_THRESHOLD = 0.80;
+      const MIN_RESPONSE_RATIO = 0.30; // Priority 2: lowered from 0.50
 
       for (let roundNum = 1; roundNum <= maxRounds; roundNum++) {
         console.log(`[review] Round ${roundNum}/${maxRounds} for ${reviewId}`);
@@ -773,9 +1111,10 @@ export const runDeliberation = internalAction({
             ? roundsData[roundsData.length - 1].responses
             : undefined;
 
-        const responses = await runAgentBatch(
+        const { responses, partial } = await runAgentBatch(
           ctx,
           agents,
+          personas,
           agentIds,
           agentMeta,
           roundNum,
@@ -786,15 +1125,21 @@ export const runDeliberation = internalAction({
           previousResponses,
         );
 
-        // Check if we have enough responses
-        if (responses.length < agents.length * 0.5) {
+        // Check if we have enough responses (Priority 2: lowered to 30%)
+        if (responses.length < agents.length * MIN_RESPONSE_RATIO) {
           throw new Error(
-            `Only ${responses.length}/${agents.length} agents responded in round ${roundNum}`,
+            `Only ${responses.length}/${agents.length} agents responded in round ${roundNum} (below ${MIN_RESPONSE_RATIO * 100}% threshold)`,
           );
         }
 
-        // Measure convergence
-        const convergenceScore = measureConvergence(responses);
+        if (partial) {
+          console.warn(
+            `[review] Round ${roundNum} partial: ${responses.length}/${agents.length} agents responded`,
+          );
+        }
+
+        // Measure convergence (Priority 3: embedding-based with multi-dimensional scoring)
+        const convergenceScore = await measureConvergence(responses);
 
         // Build round data
         const roundData: RoundData = {
@@ -802,6 +1147,7 @@ export const runDeliberation = internalAction({
           responses,
           convergenceScore,
           summary: previousSummary,
+          partial,
         };
         roundsData.push(roundData);
 
@@ -825,7 +1171,7 @@ export const runDeliberation = internalAction({
         });
 
         console.log(
-          `[review] Round ${roundNum} complete: convergence=${convergenceScore.toFixed(3)}, responses=${responses.length}`,
+          `[review] Round ${roundNum} complete: convergence=${convergenceScore.toFixed(3)}, responses=${responses.length}${partial ? " (partial)" : ""}`,
         );
 
         // Early exit on convergence
@@ -837,10 +1183,13 @@ export const runDeliberation = internalAction({
         }
       }
 
-      // --- Synthesis (cached) ---
+      // --- Synthesis (cached + Zod validated) ---
       const finalRound = roundsData[roundsData.length - 1];
       const finalConvergence = finalRound?.convergenceScore ?? 0;
       const synthesis = await generateSynthesis(ctx, roundsData, finalConvergence);
+
+      // Check if any round was partial
+      const hadPartialRounds = roundsData.some((r) => r.partial);
 
       // Compute agent journeys
       const agentJourneys = agents.map((_, i) => {
@@ -910,7 +1259,9 @@ export const runDeliberation = internalAction({
         completedAt: Date.now(),
       });
 
-      console.log(`[review] Completed ${reviewId}: approval=${synthesis.approvalScore}`);
+      console.log(
+        `[review] Completed ${reviewId}: approval=${synthesis.approvalScore}${hadPartialRounds ? " (had partial rounds)" : ""}`,
+      );
 
       // --- Webhook ---
       if (callbackUrl && callbackSecret) {
@@ -918,6 +1269,7 @@ export const runDeliberation = internalAction({
           review_id: reviewId,
           session_id: sessionId,
           status: "completed" as const,
+          partial: hadPartialRounds,
           decision: {
             winning_position: synthesis.winningPosition,
             convergence_score: finalConvergence,
