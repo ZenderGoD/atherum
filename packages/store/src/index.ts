@@ -2,7 +2,7 @@
  * @atherum/store
  *
  * Storage layer for Atherum — backed by Convex.
- * The Convex schema and functions live in apps/api/convex/.
+ * The Convex schema and functions live in convex/ at the monorepo root.
  * This package exports the ConvexHttpClient helper for use by other packages.
  */
 
